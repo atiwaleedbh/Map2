@@ -1,142 +1,148 @@
-import os, time, re, json
-import pandas as pd
+# app.py
+import os
+import re
+import time
+import json
 import requests
-import googlemaps
+import pandas as pd
 import streamlit as st
+import googlemaps
+import openai
 from dotenv import load_dotenv
-from openai import OpenAI  # الجديد
 
-# Load .env
+# Load .env if exists
 load_dotenv()
 
-# API keys
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+# Load API keys from environment
 MAPS_KEY = os.getenv("GOOGLE_MAPS_KEY", "").strip()
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-client = OpenAI(api_key=OPENAI_KEY)  # جديد
-
-st.set_page_config(page_title="Google Maps Restaurant Classifier", layout="wide")
-st.title("🍽️ Google Maps Restaurant Classifier with GPT (Batch)")
+st.set_page_config(page_title="Restaurant Classifier", layout="wide")
+st.title("🍽️ Restaurant Classifier — Streamlit + GPT (Step-by-step)")
 
 # Sidebar for keys
 with st.sidebar:
-    st.header("API Keys / Settings")
+    st.header("API keys / settings")
     maps_key_input = st.text_input("Google Maps API Key", value=MAPS_KEY, type="password")
     openai_key_input = st.text_input("OpenAI API Key", value=OPENAI_KEY, type="password")
-    model_input = st.text_input("OpenAI Model", value=OPENAI_MODEL)
-    if st.button("Update Keys"):
+    model_input = st.text_input("OpenAI model (optional)", value=OPENAI_MODEL)
+    if st.button("Use these keys"):
         MAPS_KEY = maps_key_input.strip()
         OPENAI_KEY = openai_key_input.strip()
         OPENAI_MODEL = model_input.strip()
-        client = OpenAI(api_key=OPENAI_KEY)
-        st.success("Keys updated in memory")
+        st.success("Keys updated (in-memory)")
 
-# Session state
-if "coords" not in st.session_state: st.session_state["coords"] = None
-if "restaurants" not in st.session_state: st.session_state["restaurants"] = None
-if "classified" not in st.session_state: st.session_state["classified"] = None
-
-# Helper functions
-def expand_short_url(url, timeout=4):
+# Helpers
+def expand_short_url_once(url: str, timeout=4):
     try:
         r = requests.get(url, allow_redirects=True, timeout=timeout)
         return r.url
     except Exception:
         return url
 
-def extract_coordinates(url):
+def extract_coordinates(url: str):
     start = time.time()
-    if not url: return None, None, 0
+    if not url:
+        return None, None, round(time.time()-start,3)
     u = url.strip()
-    if "maps.app.goo.gl" in u or "goo.gl" in u: u = expand_short_url(u)
+    if "maps.app.goo.gl" in u or "goo.gl" in u:
+        u = expand_short_url_once(u)
     m = re.search(r'@([-+]?\d+\.\d+),([-+]?\d+\.\d+)', u)
-    if m: return float(m.group(1)), float(m.group(2)), round(time.time()-start,3)
+    if m:
+        return float(m.group(1)), float(m.group(2)), round(time.time()-start,3)
+    m = re.search(r'!3d([-+]?\d+\.\d+)!4d([-+]?\d+\.\d+)', u)
+    if m:
+        return float(m.group(1)), float(m.group(2)), round(time.time()-start,3)
+    m = re.search(r'([-+]?\d{1,3}\.\d+)[, ]+([-+]?\d{1,3}\.\d+)', u)
+    if m:
+        lat, lng = float(m.group(1)), float(m.group(2))
+        if -90 <= lat <= 90 and -180 <= lng <= 180:
+            return lat, lng, round(time.time()-start,3)
     return None, None, round(time.time()-start,3)
 
-def fetch_restaurants(lat, lng, maps_key, radius=3000, max_pages=2):
-    client_maps = googlemaps.Client(key=maps_key)
+def fetch_restaurants_places(lat, lng, maps_key, radius=3000, max_pages=3):
+    client = googlemaps.Client(key=maps_key)
     all_results = []
-    places = client_maps.places_nearby(location=(lat,lng), radius=radius, type="restaurant")
+    places = client.places_nearby(location=(lat,lng), radius=radius, type="restaurant")
     all_results.extend(places.get("results", []))
     pages = 0
     while places.get("next_page_token") and pages < max_pages:
         pages += 1
         time.sleep(2)
-        places = client_maps.places_nearby(page_token=places["next_page_token"])
+        places = client.places_nearby(page_token=places["next_page_token"])
         all_results.extend(places.get("results", []))
     rows = []
     for r in all_results:
-        try:
-            details = client_maps.place(place_id=r["place_id"], fields=["review"])
-            reviews = details.get("result", {}).get("reviews", [])
-            reviews_text = " | ".join([rev.get("text","") for rev in reviews[:3]])
-        except:
-            reviews_text = ""
         rows.append({
             "name": r.get("name",""),
             "address": r.get("vicinity",""),
+            "rating": r.get("rating",""),
             "types": ", ".join(r.get("types", [])),
             "place_id": r.get("place_id",""),
-            "reviews": reviews_text
+            "map_url": f"https://www.google.com/maps/place/?q=place_id:{r.get('place_id','')}"
         })
     return pd.DataFrame(rows)
 
-# Step 1: Google Maps URL
-st.subheader("Step 1: Paste Google Maps URL (short or long)")
-maps_url = st.text_input("Google Maps URL", placeholder="https://www.google.com/maps/place/...")
-if st.button("▶️ Start - Extract Coordinates"):
-    lat, lng, t = extract_coordinates(maps_url)
+def classify_all_with_gpt(df):
+    """Send all restaurants at once to GPT for custom classification."""
+    if df.empty:
+        return pd.DataFrame()
+    openai.api_key = OPENAI_KEY
+    system_msg = "أنت مساعد لتصنيف أسماء المطاعم. صنّف هذه المطاعم بشكل مناسب استنادًا إلى أسمائها وتعليقات المستخدمين. أجب JSON array: [{\"name\": ..., \"category\": ...}]"
+    restaurants_list = df[["name","address","types"]].to_dict(orient="records")
+    user_msg = f"Restaurants:\n{json.dumps(restaurants_list, ensure_ascii=False)}"
+    messages = [{"role":"system","content":system_msg}, {"role":"user","content":user_msg}]
+    try:
+        resp = openai.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0,
+            max_tokens=2000
+        )
+        text = resp.choices[0].message.content
+        # clean code fences
+        clean_text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE)
+        return pd.DataFrame(json.loads(clean_text))
+    except Exception as e:
+        st.error(f"Error calling GPT: {e}")
+        return pd.DataFrame()
+
+# Session state
+if "coords" not in st.session_state: st.session_state["coords"] = None
+if "restaurants" not in st.session_state: st.session_state["restaurants"] = None
+if "classified" not in st.session_state: st.session_state["classified"] = None
+
+# UI
+st.markdown("### 1) Paste Google Maps URL (short or long) and press **Start**")
+url = st.text_input("Google Maps URL")
+if st.button("▶️ Start — Extract Coordinates"):
+    lat, lng, t = extract_coordinates(url)
     if lat is None:
-        st.error(f"Could not extract coordinates (took {t}s). Try full URL or long link.")
+        st.error(f"Could not extract coordinates (took {t}s).")
     else:
-        st.session_state["coords"] = (lat, lng)
+        st.session_state["coords"] = (lat,lng)
         st.success(f"Coordinates: {lat}, {lng} (extraction {t}s)")
 
-# Step 2: Fetch restaurants & reviews
-st.subheader("Step 2: Fetch Nearby Restaurants & Reviews")
-if st.button("➡️ Fetch Restaurants & Reviews"):
+st.markdown("### 2) Fetch nearby restaurants")
+if st.button("➡️ Fetch Restaurants"):
     if not st.session_state["coords"]:
-        st.error("No coordinates. Run Step 1 first.")
-    elif not MAPS_KEY:
-        st.error("Set Google Maps API key.")
+        st.error("No coordinates found.")
     else:
         lat,lng = st.session_state["coords"]
-        with st.spinner("Fetching restaurants and reviews..."):
-            df = fetch_restaurants(lat, lng, MAPS_KEY)
-            st.session_state["restaurants"] = df
-            st.success(f"Fetched {len(df)} restaurants")
-            st.dataframe(df[["name","address","types","reviews"]].head(50))
-
-# Step 3: Classify all at once via GPT
-st.subheader("Step 3: Classify All Restaurants with GPT")
-if st.button("➡️ Classify All Restaurants"):
-    df = st.session_state["restaurants"]
-    if df is None or df.empty:
-        st.error("No restaurants to classify. Run Step 2 first.")
-    else:
-        prompt = "Categorize the following restaurants dynamically based on name, address, types, and reviews. Return JSON array of objects {name, category}.\n"
-        for _, row in df.iterrows():
-            prompt += f"- Name: {row['name']}, Address: {row['address']}, Types: {row['types']}, Reviews: {row['reviews']}\n"
         try:
-            with st.spinner("Classifying with GPT..."):
-                resp = client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[
-                        {"role":"system","content":"You categorize restaurants dynamically."},
-                        {"role":"user","content":prompt}
-                    ],
-                    temperature=0.7,
-                    max_tokens=1500
-                )
-                text = resp.choices[0].message.content
-                try:
-                    categorized = json.loads(text)
-                    st.session_state["classified"] = pd.DataFrame(categorized)
-                    st.subheader("Categorized Restaurants")
-                    st.dataframe(st.session_state["classified"])
-                except Exception:
-                    st.warning("Could not parse GPT output as JSON. Raw output:")
-                    st.text(text)
+            df = fetch_restaurants_places(lat,lng, MAPS_KEY)
+            st.session_state["restaurants"] = df
+            st.dataframe(df[["name","address","rating","types"]].head(50))
         except Exception as e:
-            st.error(f"Error calling GPT: {e}")
+            st.error(f"Places API error: {e}")
+
+st.markdown("### 3) Classify all restaurants with GPT")
+if st.button("➡️ Classify All"):
+    if st.session_state["restaurants"] is None:
+        st.error("No restaurants loaded.")
+    else:
+        st.session_state["classified"] = classify_all_with_gpt(st.session_state["restaurants"])
+        if not st.session_state["classified"].empty:
+            st.subheader("Classified Restaurants")
+            st.dataframe(st.session_state["classified"])
