@@ -1,204 +1,146 @@
-# app.py
-import os
-import re
-import time
-import requests
+import os, time, json, re
 import pandas as pd
-import googlemaps
+import requests
 import openai
+import googlemaps
 import streamlit as st
 from dotenv import load_dotenv
 
-# Load local .env if present
+# Load env if exists
 load_dotenv()
 
-# Read keys from env or secrets
-MAPS_KEY = os.getenv("GOOGLE_MAPS_KEY", "").strip()
+# Read keys
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")  # model must be supported
+MAPS_KEY = os.getenv("GOOGLE_MAPS_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+openai.api_key = OPENAI_KEY
 
-st.set_page_config(page_title="Restaurant Classifier", layout="wide")
-st.title("🍽️ Restaurant Classifier — Streamlit + ChatGPT")
+st.set_page_config(page_title="Batch Restaurant Classifier", layout="wide")
+st.title("🍽️ Batch Restaurant Classifier with Reviews & GPT")
 
-# Sidebar for keys
+# Sidebar keys override
 with st.sidebar:
-    st.header("API keys / settings")
+    st.header("API Keys / Settings")
     maps_key_input = st.text_input("Google Maps API Key", value=MAPS_KEY, type="password")
     openai_key_input = st.text_input("OpenAI API Key", value=OPENAI_KEY, type="password")
-    model_input = st.text_input("OpenAI model", value=OPENAI_MODEL)
-    if st.button("Use these keys"):
+    model_input = st.text_input("OpenAI Model", value=OPENAI_MODEL)
+    if st.button("Update Keys"):
         MAPS_KEY = maps_key_input.strip()
         OPENAI_KEY = openai_key_input.strip()
         OPENAI_MODEL = model_input.strip()
-        st.success("Keys updated (in-memory)")
+        openai.api_key = OPENAI_KEY
+        st.success("Keys updated in memory")
 
-st.write("Maps key loaded:", bool(MAPS_KEY), " — OpenAI key loaded:", bool(OPENAI_KEY))
-st.write("OpenAI model:", OPENAI_MODEL)
+# Session state
+if "restaurants" not in st.session_state:
+    st.session_state["restaurants"] = pd.DataFrame([
+        {"name": "مطاعم فلفلة", "address": "Dammam"},
+        {"name": "Burger King", "address": "Riyadh"},
+        {"name": "Indian Palace", "address": "Jeddah"}
+    ])
+if "classified" not in st.session_state:
+    st.session_state["classified"] = None
 
-if not MAPS_KEY:
-    st.warning("Set GOOGLE_MAPS_KEY to enable Places API.")
-if not OPENAI_KEY:
-    st.warning("Set OPENAI_API_KEY to enable OpenAI calls.")
-
-# Helpers
-def expand_short_url_once(url: str, timeout=4):
+# Functions
+def expand_short_url(url, timeout=4):
     try:
         r = requests.get(url, allow_redirects=True, timeout=timeout)
         return r.url
     except Exception:
         return url
 
-def extract_coordinates(url: str):
+def extract_coordinates(url):
     start = time.time()
     if not url:
-        return None, None, round(time.time()-start, 3)
+        return None, None, 0
     u = url.strip()
     if "maps.app.goo.gl" in u or "goo.gl" in u:
-        u = expand_short_url_once(u)
+        u = expand_short_url(u)
     m = re.search(r'@([-+]?\d+\.\d+),([-+]?\d+\.\d+)', u)
     if m:
         return float(m.group(1)), float(m.group(2)), round(time.time()-start,3)
-    m = re.search(r'!3d([-+]?\d+\.\d+)!4d([-+]?\d+\.\d+)', u)
-    if m:
-        return float(m.group(1)), float(m.group(2)), round(time.time()-start,3)
-    m = re.search(r'([-+]?\d{1,3}\.\d+)[, ]+([-+]?\d{1,3}\.\d+)', u)
-    if m:
-        lat, lng = float(m.group(1)), float(m.group(2))
-        if -90 <= lat <= 90 and -180 <= lng <= 180:
-            return lat, lng, round(time.time()-start,3)
     return None, None, round(time.time()-start,3)
 
-def fetch_restaurants_places(lat, lng, maps_key, radius=3000, max_pages=3):
-    client = googlemaps.Client(key=maps_key)
-    all_results = []
-    places = client.places_nearby(location=(lat,lng), radius=radius, type="restaurant")
-    all_results.extend(places.get("results", []))
-    pages = 0
-    while places.get("next_page_token") and pages < max_pages:
-        pages += 1
-        time.sleep(2)
-        places = client.places_nearby(page_token=places["next_page_token"])
-        all_results.extend(places.get("results", []))
-    rows = []
-    for r in all_results:
-        rows.append({
-            "name": r.get("name",""),
-            "address": r.get("vicinity",""),
-            "rating": r.get("rating",""),
-            "types": ", ".join(r.get("types", [])),
-            "place_id": r.get("place_id",""),
-            "map_url": f"https://www.google.com/maps/place/?q=place_id:{r.get('place_id','')}"
-        })
-    return pd.DataFrame(rows)
-
-CATEGORIES_AR = [
-    "مطاعم هندية",
-    "مطاعم شاورما",
-    "مطاعم لبنانية",
-    "مطاعم خليجية",
-    "مطاعم أسماك",
-    "مطاعم برجر",
-    "أخرى"
-]
-
-def classify_with_chatgpt(name: str, address: str, types: str, timeout_s=30):
-    if not OPENAI_KEY:
-        return "❌ OpenAI API key missing", None
-    openai.api_key = OPENAI_KEY
-    system_msg = (
-        "أنت مساعد لتصنيف أسماء المطاعم. صنّف المطعم إلى أحد التصنيفات التالية: "
-        + ", ".join(CATEGORIES_AR)
-        + ". أجب فقط بالكلمة العربية المطابقة."
-    )
-    user_msg = f"Name: {name}\nAddress: {address}\nTypes: {types}"
+def fetch_reviews(place_id, client, max_reviews=3):
     try:
-        t0 = time.time()
-        resp = openai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role":"system","content":system_msg},
-                {"role":"user","content":user_msg}
-            ],
-            max_tokens=20,
-            temperature=0
-        )
-        elapsed = time.time()-t0
-        text = resp.choices[0].message.content.strip()
-        if text in CATEGORIES_AR:
-            return text, round(elapsed,2)
-        low = text.lower()
-        if "indian" in low or "هندي" in low: return "مطاعم هندية", round(elapsed,2)
-        if "shawarma" in low or "شاورما" in low: return "مطاعم شاورما", round(elapsed,2)
-        if "lebanese" in low or "لبناني" in low: return "مطاعم لبنانية", round(elapsed,2)
-        if "gulf" in low or "khaleeji" in low or "خليج" in low: return "مطاعم خليجية", round(elapsed,2)
-        if "fish" in low or "seafood" in low or "سمك" in low: return "مطاعم أسماك", round(elapsed,2)
-        if "burger" in low or "برجر" in low: return "مطاعم برجر", round(elapsed,2)
-        return "أخرى", round(elapsed,2)
-    except Exception as e:
-        return f"❌ Error: {e}", None
+        details = client.place(place_id=place_id, fields=["review"])
+        reviews = details.get("result", {}).get("reviews", [])
+        return " | ".join(r.get("text","") for r in reviews[:max_reviews])
+    except:
+        return ""
 
-# Session state
-if "coords" not in st.session_state: st.session_state["coords"] = None
-if "restaurants" not in st.session_state: st.session_state["restaurants"] = None
-if "classified" not in st.session_state: st.session_state["classified"] = []
-if "index" not in st.session_state: st.session_state["index"] = 0
-
-# UI steps
-st.markdown("### 1) Paste Google Maps URL")
-url = st.text_input("Google Maps URL", placeholder="https://www.google.com/maps/place/...")
-if st.button("▶️ Start — Extract Coordinates"):
-    lat, lng, t = extract_coordinates(url)
-    if lat is None:
-        st.error(f"Could not extract coordinates (took {t}s).")
-    else:
-        st.session_state["coords"] = (lat,lng)
-        st.success(f"Coordinates: {lat}, {lng} (extraction {t}s)")
-
-st.markdown("### 2) Fetch nearby restaurants")
-if st.button("➡️ Continue — Fetch Restaurants"):
-    if not st.session_state["coords"]:
-        st.error("No coordinates — run Start first.")
-    else:
-        lat, lng = st.session_state["coords"]
+def enrich_restaurants(df, maps_key):
+    client = googlemaps.Client(key=maps_key)
+    enriched = []
+    for _, row in df.iterrows():
         try:
-            df = fetch_restaurants_places(lat, lng, MAPS_KEY)
-            if df.empty:
-                st.warning("No restaurants found.")
-            else:
-                st.session_state["restaurants"] = df
-                st.session_state["classified"] = []
-                st.session_state["index"] = 0
-                st.success(f"Found {len(df)} restaurants (showing first 50).")
-                st.dataframe(df[["name","address","rating","types"]].head(50))
+            result = client.find_place(input=row["name"], input_type="textquery", fields=["place_id","formatted_address","types"])
+            candidates = result.get("candidates", [])
+            if not candidates:
+                enriched.append({**row, "place_id":"", "reviews":""})
+                continue
+            place = candidates[0]
+            reviews = fetch_reviews(place["place_id"], client)
+            enriched.append({
+                "name": row["name"],
+                "address": place.get("formatted_address", row["address"]),
+                "types": ",".join(place.get("types", [])),
+                "place_id": place["place_id"],
+                "reviews": reviews
+            })
+        except:
+            enriched.append({**row, "place_id":"", "reviews":""})
+    return pd.DataFrame(enriched)
+
+# Step 1: show restaurants
+st.subheader("Restaurants")
+st.dataframe(st.session_state["restaurants"])
+
+# Step 2: fetch reviews
+if st.button("➡️ Fetch Reviews from Google Maps"):
+    if not MAPS_KEY:
+        st.error("Set Google Maps API key first")
+    else:
+        with st.spinner("Fetching reviews..."):
+            df_enriched = enrich_restaurants(st.session_state["restaurants"], MAPS_KEY)
+            st.session_state["restaurants"] = df_enriched
+            st.success("Reviews fetched")
+            st.dataframe(df_enriched)
+
+# Step 3: batch classify with GPT
+if st.button("➡️ Classify All Restaurants with GPT"):
+    df = st.session_state["restaurants"]
+    if df.empty or "reviews" not in df.columns:
+        st.error("No restaurant data with reviews. Run previous step first.")
+    else:
+        prompt = "You are an assistant that categorizes restaurants based on names, addresses, types, and reviews. " \
+                 "Create dynamic categories and return a JSON array [{name, category}].\n"
+        for _, row in df.iterrows():
+            prompt += f"- Name: {row['name']}, Address: {row.get('address','')}, Types: {row.get('types','')}, Reviews: {row.get('reviews','')}\n"
+
+        try:
+            with st.spinner("Classifying..."):
+                t0 = time.time()
+                resp = openai.ChatCompletion.create(
+                    model=OPENAI_MODEL,
+                    messages=[
+                        {"role":"system","content":"You categorize restaurants dynamically."},
+                        {"role":"user","content":prompt}
+                    ],
+                    max_tokens=1500,
+                    temperature=0.7
+                )
+                elapsed = round(time.time()-t0,2)
+                text = resp["choices"][0]["message"]["content"]
+
+                try:
+                    categorized = json.loads(text)
+                    categorized_df = pd.DataFrame(categorized)
+                    st.subheader("Categorized Restaurants")
+                    st.dataframe(categorized_df)
+                except Exception:
+                    st.warning("Could not parse GPT response as JSON. Raw output:")
+                    st.text(text)
+                st.success(f"Classification completed in {elapsed} seconds")
         except Exception as e:
-            st.error(f"Places API error: {e}")
-
-st.markdown("### 3) Classify restaurants one-by-one")
-col1, col2 = st.columns([1,3])
-with col1:
-    if st.button("➡️ Classify Next"):
-        if st.session_state["restaurants"] is None:
-            st.error("No restaurants loaded.")
-        else:
-            idx = st.session_state["index"]
-            if idx >= len(st.session_state["restaurants"]):
-                st.success("All restaurants classified.")
-            else:
-                row = st.session_state["restaurants"].iloc[idx]
-                cat, t = classify_with_chatgpt(row["name"], row["address"], row["types"])
-                st.session_state["classified"].append({
-                    "name": row["name"],
-                    "address": row["address"],
-                    "category": cat,
-                    "map_url": row.get("map_url",""),
-                    "time_s": t
-                })
-                st.session_state["index"] += 1
-                st.success(f"Classified {row['name']} -> {cat} (took {t}s)")
-
-with col2:
-    st.write("Progress:", st.session_state["index"], "/", len(st.session_state["restaurants"]) if st.session_state["restaurants"] is not None else 0)
-
-if st.session_state["classified"]:
-    st.subheader("Classified so far")
-    st.dataframe(pd.DataFrame(st.session_state["classified"]))
+            st.error(f"Error calling OpenAI API: {e}")
