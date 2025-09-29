@@ -20,7 +20,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 st.set_page_config(page_title="Restaurant Classifier", layout="wide")
 st.title("🍽️ Restaurant Classifier — Cuisine-based")
 
-# Sidebar for keys
+# Sidebar
 with st.sidebar:
     st.header("🔑 API Keys")
     maps_key_input = st.text_input("Google Maps API Key", value=MAPS_KEY, type="password")
@@ -32,7 +32,7 @@ with st.sidebar:
         OPENAI_MODEL = model_input.strip()
         st.success("✅ Keys updated (in-memory)")
 
-# -------- Helpers --------
+# Helpers
 def expand_short_url_once(url: str, timeout=4):
     try:
         r = requests.get(url, allow_redirects=True, timeout=timeout)
@@ -96,16 +96,16 @@ def classify_cuisine_with_gpt(df):
     openai.api_key = OPENAI_KEY
 
     system_msg = """
-    أنت مساعد ذكي لتصنيف المطاعم.
-    اقرأ الاسم + الأنواع + المراجعات،
-    ثم حدد نوع المطبخ (Cuisine) مثل:
-    هندي، آسيوي، خليجي، لبناني، أمريكي، برجر، مأكولات سريعة، بحرية، مقهى، حلويات...
-    أرجع النتائج في JSON array كالتالي:
-    [{"name": ..., "cuisine": ..., "rating": ..., "map_url": ...}]
+    أنت مساعد ذكي لتصنيف المطاعم حسب نوع المطبخ (Cuisine).
+    اقرأ اسم المطعم، الأنواع، ومراجعات المستخدمين،
+    ثم صنف كل مطعم إلى فئة Cuisine مناسبة مثل:
+    هندي، آسيوي، خليجي، لبناني، أمريكي، برجر، مأكولات سريعة، بحرية، مقهى، حلويات، وغيرها.
+    أرجع النتائج في **JSON صالح فقط**:
+    [{"name": "...", "cuisine": "...", "rating": ..., "map_url": "..."}]
     """
 
     restaurants_list = df[["name","types","reviews","rating","map_url"]].to_dict(orient="records")
-    user_msg = f"Restaurants data:\n{json.dumps(restaurants_list, ensure_ascii=False)}"
+    user_msg = f"Restaurants data:\n{json.dumps(restaurants_list[:50], ensure_ascii=False)}"
 
     try:
         resp = openai.chat.completions.create(
@@ -117,23 +117,26 @@ def classify_cuisine_with_gpt(df):
             temperature=0,
             max_tokens=3000
         )
-        text = resp.choices[0].message.content
-        clean_text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE)
+        text = resp.choices[0].message.content.strip()
+        clean_text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+        clean_text = clean_text.replace("'", '"')
         return pd.DataFrame(json.loads(clean_text))
+    except json.JSONDecodeError as je:
+        st.error(f"JSON parsing error: {je}\nRaw output:\n{text}")
+        return pd.DataFrame()
     except Exception as e:
         st.error(f"Error calling GPT: {e}")
         return pd.DataFrame()
 
-# -------- Session state --------
+# Session state
 if "coords" not in st.session_state: st.session_state["coords"] = None
 if "restaurants" not in st.session_state: st.session_state["restaurants"] = None
 if "classified" not in st.session_state: st.session_state["classified"] = None
 
-# -------- UI --------
+# UI
 st.markdown("### 1) Paste Google Maps URL")
 url = st.text_input("Google Maps URL")
-
-if st.button("📍 Extract Coordinates"):
+if st.button("▶️ Extract Coordinates"):
     lat, lng, t = extract_coordinates(url)
     if lat is None:
         st.error(f"❌ Could not extract coordinates (took {t}s).")
@@ -141,22 +144,22 @@ if st.button("📍 Extract Coordinates"):
         st.session_state["coords"] = (lat,lng)
         st.success(f"✅ Coordinates: {lat}, {lng} (extraction {t}s)")
 
-st.markdown("### 2) Fetch nearby restaurants (3km)")
-if st.button("🍴 Fetch Restaurants"):
+st.markdown("### 2) Fetch nearby restaurants")
+if st.button("➡️ Fetch Restaurants"):
     if not st.session_state["coords"]:
         st.error("⚠️ No coordinates found.")
     else:
         lat,lng = st.session_state["coords"]
         try:
-            df = fetch_restaurants_with_reviews(lat,lng, MAPS_KEY, radius=3000)
+            df = fetch_restaurants_with_reviews(lat,lng, MAPS_KEY)
             st.session_state["restaurants"] = df
             st.subheader("📋 Restaurants Found")
             st.dataframe(df[["name","address","rating","types","reviews","map_url"]].head(30))
         except Exception as e:
             st.error(f"Places API error: {e}")
 
-st.markdown("### 3) Classify restaurants by cuisine with GPT")
-if st.button("🤖 Classify All"):
+st.markdown("### 3) Classify restaurants by Cuisine")
+if st.button("➡️ Classify All"):
     if st.session_state["restaurants"] is None:
         st.error("⚠️ No restaurants loaded.")
     else:
