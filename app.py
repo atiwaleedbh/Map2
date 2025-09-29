@@ -1,28 +1,36 @@
+import re
 import requests
 import json
 import streamlit as st
 from openai import OpenAI
 
-# إعداد OpenAI
-client = OpenAI(api_key="YOUR_API_KEY")
-
-# استدعاء Google Places API
+# إعداد مفاتيح API
+client = OpenAI(api_key="YOUR_OPENAI_API_KEY")
 GOOGLE_API_KEY = "YOUR_GOOGLE_API_KEY"
-PLACES_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+
+NEARBY_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
 DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
 
-# 1. جلب قائمة المطاعم
-def fetch_restaurants(location="Dammam", query="restaurants"):
-    params = {"query": query + " in " + location, "key": GOOGLE_API_KEY}
-    response = requests.get(PLACES_URL, params=params)
-    results = response.json().get("results", [])
+
+# 🔹 استخراج الإحداثيات من رابط خرائط قوقل
+def extract_coordinates_from_url(url):
+    match = re.search(r'@([-0-9.]+),([-0-9.]+)', url)
+    if match:
+        return float(match.group(1)), float(match.group(2))
+    return None, None
+
+
+# 🔹 جلب قائمة المطاعم بالقرب من إحداثيات معينة
+def fetch_restaurants_nearby(lat, lng, radius=3000):
+    params = {"location": f"{lat},{lng}", "radius": radius, "type": "restaurant", "key": GOOGLE_API_KEY}
+    response = requests.get(NEARBY_URL, params=params).json()
+    results = response.get("results", [])
 
     restaurants = []
     for place in results:
         place_id = place.get("place_id")
         details_params = {"place_id": place_id, "key": GOOGLE_API_KEY, "language": "ar"}
-        details_response = requests.get(DETAILS_URL, params=details_params)
-        details = details_response.json().get("result", {})
+        details = requests.get(DETAILS_URL, params=details_params).json().get("result", {})
 
         reviews = [r.get("text", "") for r in details.get("reviews", [])]
 
@@ -35,7 +43,8 @@ def fetch_restaurants(location="Dammam", query="restaurants"):
 
     return restaurants
 
-# 2. إرسال للموديل GPT لتصنيف المطاعم
+
+# 🔹 GPT لتصنيف المطاعم حسب نوع المطبخ (Cuisine)
 def classify_restaurants(restaurants):
     restaurants_text = "\n\n".join([
         f"Name: {r['name']}\nDescription: {r.get('description', 'N/A')}\nReviews: {', '.join(r.get('reviews', []))}\nLink: {r.get('link','')}"
@@ -44,17 +53,14 @@ def classify_restaurants(restaurants):
 
     prompt = f"""
 You are a smart restaurant classification assistant.
-You will receive a list of restaurants with their name, description, user reviews, and Google Maps link.
-For each restaurant, analyze the information and classify it into a cuisine type 
+Analyze the following restaurants (name + description + reviews) and classify each into cuisine type 
 (like: Indian, Asian, Gulf, Lebanese, American, Burger, Pizza, Seafood, Fast Food, Bakery, Cafe, etc).
-Be as accurate as possible, even if cuisine type is implicit from the name or reviews.
-
-Return ONLY valid JSON array. Each item must have:
+Return ONLY valid JSON array with:
 - name
 - cuisine
 - link
 
-Here are the restaurants:
+Restaurants data:
 
 {restaurants_text}
 """
@@ -78,26 +84,34 @@ Here are the restaurants:
 
     return data
 
-# 3. واجهة Streamlit
-def main():
-    st.title("Restaurant Classifier 🍴")
-    st.write("أدخل مدينة للبحث عن المطاعم وتصنيفها حسب نوع المطبخ (Cuisine).")
 
-    location = st.text_input("الموقع:", "Dammam")
+# 🔹 واجهة Streamlit
+def main():
+    st.title("📍 مطاعم قريبة مع التصنيف الذكي")
+    st.write("ألصق رابط خرائط قوقل (Google Maps) لأي موقع، وسيتم البحث عن المطاعم القريبة (٣ كم) وتصنيفها حسب نوع المطبخ.")
+
+    url = st.text_input("ألصق رابط خرائط قوقل هنا:")
+
     if st.button("Fetch Restaurants"):
+        lat, lng = extract_coordinates_from_url(url)
+        if not lat or not lng:
+            st.error("تعذر استخراج الإحداثيات من الرابط. تأكد أن الرابط يحتوي على إحداثيات (مثل ...@26.12345,50.12345...).")
+            return
+
         with st.spinner("جاري جلب المطاعم من خرائط قوقل..."):
-            restaurants = fetch_restaurants(location)
-            st.success(f"تم العثور على {len(restaurants)} مطاعم.")
+            restaurants = fetch_restaurants_nearby(lat, lng)
+            st.success(f"✅ تم العثور على {len(restaurants)} مطاعم.")
 
             if restaurants:
-                st.write("### المطاعم المستخرجة من خرائط قوقل:")
+                st.write("### 📌 جدول بيانات المطاعم من Google Maps")
                 st.json(restaurants)
 
-                with st.spinner("جاري تحليل المطاعم وتصنيفها..."):
+                with st.spinner("🤖 جاري تحليل المطاعم وتصنيفها..."):
                     classified = classify_restaurants(restaurants)
 
-                st.write("### جدول التصنيف النهائي")
+                st.write("### 🍽️ جدول التصنيف النهائي")
                 st.table(classified)
+
 
 if __name__ == "__main__":
     main()
