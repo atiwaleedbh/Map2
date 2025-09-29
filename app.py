@@ -15,7 +15,7 @@ load_dotenv()
 # Read keys from environment or Streamlit secrets
 MAPS_KEY = os.getenv("GOOGLE_MAPS_KEY", "")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = "gpt-3.5-turbo"  # النسخة الأقل تكلفة
+OPENAI_MODEL = "gpt-3.5-turbo-0613"  # النسخة الأقل تكلفة
 
 st.set_page_config(page_title="Restaurant Classifier", layout="wide")
 st.title("🍽️ Restaurant Classifier — Step by Step (gpt-3.5-turbo)")
